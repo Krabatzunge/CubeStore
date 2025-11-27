@@ -3,7 +3,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -11,9 +13,31 @@ use aes_gcm::{
 };
 use sha2::{Digest, Sha256};
 
+pub struct Observable<T> {
+    // A shared reference to the raw bytes
+    inner: Arc<RwLock<Vec<u8>>>,
+    // We pretend we hold a T for type safety, but we don't actually own a T
+    _marker: PhantomData<T>,
+}
+
+impl<T: DeserializeOwned> Observable<T> {
+    /// Get the current value from the store.
+    /// This deserializes the latest bytes every time it is called.
+    pub fn get(&self) -> Result<T> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| anyhow!("Failed to acquire read lock"))?;
+        let obj = bincode::serde::decode_from_slice(&guard, bincode::config::standard())
+            .map(|(t, _)| t)
+            .context("Failed to deserialize object")?;
+        Ok(obj)
+    }
+}
+
 pub struct ObjectStore {
     path: PathBuf,
-    storage: HashMap<String, Vec<u8>>,
+    storage: HashMap<String, Arc<RwLock<Vec<u8>>>>,
     cipher: Aes256Gcm,
 }
 
@@ -45,9 +69,15 @@ impl ObjectStore {
                     .decrypt(nonce, ciphertext)
                     .map_err(|e| anyhow!("Decryption failed: {}", e))?;
 
-                bincode::serde::decode_from_slice(&plaintext, bincode::config::standard())
-                    .map(|(t, _)| t)
-                    .context("Failed to decode store data")?
+                let raw_map: HashMap<String, Vec<u8>> =
+                    bincode::serde::decode_from_slice(&plaintext, bincode::config::standard())
+                        .map(|(t, _)| t)
+                        .context("Failed to decode store data")?;
+
+                raw_map
+                    .into_iter()
+                    .map(|(k, v)| (k, Arc::new(RwLock::new(v))))
+                    .collect()
             }
         } else {
             HashMap::new()
@@ -63,30 +93,57 @@ impl ObjectStore {
     /// Save a generic object associated with a key.
     /// T: Serialize + Debug ensures the struct can be turned into bytes.
     pub fn insert<T: Serialize>(&mut self, key: &str, value: &T) -> Result<()> {
-        let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())
+        let new_bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())
             .context("Failed to serialize object")?;
 
-        self.storage.insert(key.to_string(), bytes);
+        // Check if the key already exists
+        if let Some(shared_handle) = self.storage.get(key) {
+            // UPDATE EXISTING: Write to the existing shared memory location.
+            // Any Observable holding this handle will see the new data.
+            let mut guard = shared_handle
+                .write()
+                .map_err(|_| anyhow!("Failed to acquire write lock"))?;
+            *guard = new_bytes;
+        } else {
+            // INSERT NEW: Create a new shared memory location
+            self.storage
+                .insert(key.to_string(), Arc::new(RwLock::new(new_bytes)));
+        }
 
         self.flush()
     }
 
-    /// Retrieve an object by key.
+    /// Retrieve an object by key. Returns a snapshot of the value.
     /// T: DeserializeOwned ensures the struct can be created from bytes.
     pub fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
-        match self.storage.get(key) {
-            Some(bytes) => {
-                let obj = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-                    .map(|(t, _)| t)
-                    .context("Failed to deserialize object")?;
-                Ok(Some(obj))
-            }
-            None => Ok(None),
+        if let Some(shared_handle) = self.storage.get(key) {
+            let guard = shared_handle
+                .read()
+                .map_err(|_| anyhow!("Failed to acquire read lock"))?;
+            let obj = bincode::serde::decode_from_slice(&guard, bincode::config::standard())
+                .map(|(t, _)| t)
+                .context("Failed to deserialize object")?;
+            Ok(Some(obj))
+        } else {
+            Ok(None)
         }
+    }
+
+    /// Returns a reactive Observer for the given key.
+    /// If the key doesn't exist yet, this returns None.
+    pub fn watch<T: DeserializeOwned>(&self, key: &str) -> Option<Observable<T>> {
+        self.storage.get(key).map(|shared_handle| {
+            Observable {
+                inner: shared_handle.clone(), // Clone the Arc, not the data
+                _marker: PhantomData,
+            }
+        })
     }
 
     /// Delete an object by key
     pub fn remove(&mut self, key: &str) -> Result<()> {
+        // If anyone is holding an Observable to this key, their handle will still work, but it's
+        // detached from the store.
         self.storage.remove(key);
         self.flush()
     }
@@ -99,8 +156,17 @@ impl ObjectStore {
             .truncate(true) // Overwrite existing file
             .open(&self.path)?;
 
+        let mut raw_map: HashMap<String, Vec<u8>> = HashMap::new();
+        for (k, v) in &self.storage {
+            let bytes = v
+                .read()
+                .map_err(|_| anyhow!("Failed to read lock during flush"))?
+                .clone();
+            raw_map.insert(k.clone(), bytes);
+        }
+
         let cleartext: Vec<u8> =
-            bincode::serde::encode_to_vec(&self.storage, bincode::config::standard())?;
+            bincode::serde::encode_to_vec(&raw_map, bincode::config::standard())?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ciphertext = self
             .cipher
