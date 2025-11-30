@@ -1,17 +1,124 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::env;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, AeadCore, KeyInit, OsRng},
 };
+use hex::encode as hex_encode;
 use sha2::{Digest, Sha256};
+
+/// Generates a deterministic password tied to the current machine and OS.
+/// It prefers platform-specific identifiers (machine-id, hardware UUID, MachineGuid)
+/// and falls back to host/user metadata before hashing everything into a stable hex string.
+pub fn machine_password() -> Result<String> {
+    let mut components = Vec::new();
+
+    if let Some(primary) = platform_unique_identifier() {
+        components.push(primary);
+    }
+
+    // Host- and user-scoped values help differentiate devices when a primary ID is missing.
+    if let Ok(host) = env::var("HOSTNAME").or_else(|_| env::var("COMPUTERNAME")) {
+        components.push(host);
+    }
+    if let Ok(user) = env::var("USER").or_else(|_| env::var("USERNAME")) {
+        components.push(user);
+    }
+
+    // Always include the OS so dual-boot setups derive distinct values.
+    components.push(env::consts::OS.to_string());
+
+    let mut hasher = Sha256::new();
+    for part in components {
+        hasher.update(part.as_bytes());
+    }
+
+    let digest = hasher.finalize();
+    Ok(hex_encode(digest))
+}
+
+#[cfg(target_os = "linux")]
+fn platform_unique_identifier() -> Option<String> {
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(contents) = fs::read_to_string(path) {
+            let trimmed = contents.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn platform_unique_identifier() -> Option<String> {
+    // ioreg typically exposes the hardware UUID reliably.
+    let output = Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(rest) = line.split("IOPlatformUUID").nth(1) {
+                if let Some(uuid_part) = rest.split('=').nth(1) {
+                    let candidate = uuid_part.trim().trim_matches('"').to_string();
+                    if !candidate.is_empty() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback to system_profiler for environments where ioreg output changed.
+    let alt_output = Command::new("system_profiler")
+        .args(["SPHardwareDataType"])
+        .output()
+        .ok()?;
+    if alt_output.status.success() {
+        let stdout = String::from_utf8_lossy(&alt_output.stdout);
+        for line in stdout.lines() {
+            if let Some(rest) = line.split(':').nth(1) {
+                if line.contains("Hardware UUID") {
+                    let candidate = rest.trim().to_string();
+                    if !candidate.is_empty() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn platform_unique_identifier() -> Option<String> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let cryptography = hklm.open_subkey("SOFTWARE\\Microsoft\\Cryptography").ok()?;
+    cryptography.get_value("MachineGuid").ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn platform_unique_identifier() -> Option<String> {
+    None
+}
 
 pub struct Observable<T> {
     // A shared reference to the raw bytes
@@ -44,8 +151,8 @@ pub struct ObjectStore {
 impl ObjectStore {
     /// Create a new store instance.
     /// If the file exists, it loads it. If not, it starts empty.
-    pub fn new(file_path: &str, password: &str) -> Result<Self> {
-        let path = PathBuf::from(file_path);
+    pub fn new(folder_path: &str, store_name: &str, password: &str) -> Result<Self> {
+        let path = Path::new(folder_path).join(format!("{}.cos", store_name));
         let key = ObjectStore::derive_key(password);
         let cipher = Aes256Gcm::new(&key);
 
@@ -194,14 +301,14 @@ mod tests {
     use super::*;
     use rand::Rng;
     use serde::{Deserialize, Serialize};
-    use std::fs;
+    use std::{fs, path::Path};
 
-    fn get_temp_path() -> String {
+    fn get_temp_path() -> (String, String) {
         let mut rng = rand::rng();
         let id: u32 = rng.random();
-        let mut path = std::env::temp_dir();
-        path.push(format!("cube_store_test_{}.cos", id));
-        path.to_string_lossy().into_owned()
+        let path = std::env::temp_dir();
+        let file_name = format!("cube_store_test_{}", id);
+        (path.to_string_lossy().into_owned(), file_name)
     }
 
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -212,17 +319,28 @@ mod tests {
     }
 
     #[test]
+    fn machine_password_is_stable_and_non_empty() -> Result<()> {
+        let first = machine_password()?;
+        let second = machine_password()?;
+
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+        Ok(())
+    }
+
+    #[test]
     fn test_basic_operations() -> Result<()> {
-        let path = get_temp_path();
+        let (folder, file) = get_temp_path();
         let password = "secure_password";
+        let full_path = Path::new(&folder).join(format!("{}.cos", file));
 
         // Clean up previous run if exists (unlikely with random name)
-        if std::path::Path::new(&path).exists() {
-            fs::remove_file(&path)?;
+        if full_path.exists() {
+            fs::remove_file(&full_path)?;
         }
 
         {
-            let mut store = ObjectStore::new(&path, password)?;
+            let mut store = ObjectStore::new(&folder, &file, password)?;
 
             store.insert("key1", &"value1".to_string())?;
             store.insert("key2", &42)?;
@@ -241,13 +359,14 @@ mod tests {
             assert_eq!(val1_after, None);
         }
 
-        fs::remove_file(path).ok();
+        fs::remove_file(full_path).ok();
         Ok(())
     }
 
     #[test]
     fn test_persistence() -> Result<()> {
-        let path = get_temp_path();
+        let (folder, file) = get_temp_path();
+        let full_path = Path::new(&folder).join(format!("{}.cos", file));
         let password = "persistent_pass";
 
         let user = User {
@@ -257,35 +376,36 @@ mod tests {
         };
 
         {
-            let mut store = ObjectStore::new(&path, password)?;
+            let mut store = ObjectStore::new(&folder, &file, password)?;
             store.insert("user", &user)?;
         } // store dropped, flushed
 
         {
-            let store = ObjectStore::new(&path, password)?;
+            let store = ObjectStore::new(&folder, &file, password)?;
             let retrieved: Option<User> = store.get("user")?;
             assert_eq!(retrieved, Some(user));
         }
 
-        fs::remove_file(path).ok();
+        fs::remove_file(full_path).ok();
         Ok(())
     }
 
     #[test]
     fn test_wrong_password() -> Result<()> {
-        let path = get_temp_path();
+        let (folder, file) = get_temp_path();
+        let full_path = Path::new(&folder).join(format!("{}.cos", file));
         let password = "correct_pass";
 
         {
-            let mut store = ObjectStore::new(&path, password)?;
+            let mut store = ObjectStore::new(&folder, &file, password)?;
             store.insert("secret", &"data")?;
         }
 
         // Try opening with wrong password
-        let result = ObjectStore::new(&path, "wrong_pass");
+        let result = ObjectStore::new(&folder, &file, "wrong_pass");
         assert!(result.is_err());
 
-        fs::remove_file(path).ok();
+        fs::remove_file(full_path).ok();
         Ok(())
     }
 }
