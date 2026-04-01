@@ -171,7 +171,3 @@ The payload is a `HashMap<String, Vec<u8>>` where each value is the bincode-enco
 - Losing the password makes the store permanently unreadable.
 - `machine_password()` is convenient but provides only as much entropy as the underlying platform identifier. For high-security use cases, supply your own strong, randomly generated password.
 - The store file contains an AES-256-GCM authentication tag, so any tampering or truncation is detected on open.
-
-## License
-
-This project is provided as-is without a declared license. Contact the repository owner for usage rights.
